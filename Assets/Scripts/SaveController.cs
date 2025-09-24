@@ -57,7 +57,7 @@ public class Save : MonoBehaviour
                 lastPosition[go.name] = current;
 
                 // Debug info for normal GameObjects
-                Debug.Log($"[Record] GameObject '{go.name}' at {timeMs} ms: Position = ({current.x:F4}, {current.y:F4}, {current.z:F4})");
+                //Debug.Log($"[Record] GameObject '{go.name}' at {timeMs} ms: Position = ({current.x:F4}, {current.y:F4}, {current.z:F4})");
             }
         }
 
@@ -90,7 +90,7 @@ public class Save : MonoBehaviour
                 lastCameraForward[cam.name] = currentFwd;
 
                 // Debug info for cameras
-                Debug.Log($"[Record] Camera '{cam.name}' at {timeMs} ms: Position = ({currentPos.x:F4}, {currentPos.y:F4}, {currentPos.z:F4}), Forward = ({currentFwd.x:F4}, {currentFwd.y:F4}, {currentFwd.z:F4})");
+                //Debug.Log($"[Record] Camera '{cam.name}' at {timeMs} ms: Position = ({currentPos.x:F4}, {currentPos.y:F4}, {currentPos.z:F4}), Forward = ({currentFwd.x:F4}, {currentFwd.y:F4}, {currentFwd.z:F4})");
             }
         }
     }
