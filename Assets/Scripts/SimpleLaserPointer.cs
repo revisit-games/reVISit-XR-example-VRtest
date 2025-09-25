@@ -3,6 +3,10 @@ using UnityEngine;
 [RequireComponent(typeof(LineRenderer))]
 public class SimpleLaserPointer : MonoBehaviour
 {
+    [Header("Camera Reference")]
+    [Tooltip("The camera used for billboarding/offset. Drag the camera here. If null, falls back to Camera.main at runtime.")]
+    public Camera targetCamera;
+
     [Header("Ray Settings")]
     [Tooltip("Maximum ray length (meters)")]
     public float maxDistance = 20f;
@@ -28,6 +32,9 @@ public class SimpleLaserPointer : MonoBehaviour
     public bool clampToHitPoint = true;
 
     [Header("Reticle (Hit Dot)")]
+    [Tooltip("Extra offset along the ray direction (positive = closer to origin, negative = farther)")]
+    public float reticleDistanceOffset = 0f;
+
     [Tooltip("Reticle prefab (Quad/Sprite, etc.)")]
     public GameObject reticlePrefab;
 
@@ -71,7 +78,7 @@ public class SimpleLaserPointer : MonoBehaviour
             _reticleInstance.gameObject.SetActive(false);
         }
 
-        _mainCam = Camera.main; // Using a regular camera, make sure there is a MainCamera tag in the scene
+        _mainCam = targetCamera != null ? targetCamera : Camera.main; // Using a regular camera, make sure there is a MainCamera tag in the scene
     }
 
     void Update()
@@ -96,15 +103,24 @@ public class SimpleLaserPointer : MonoBehaviour
             {
                 _reticleInstance.gameObject.SetActive(true);
 
-                // Slightly offset from surface to avoid jittering/penetration
                 Vector3 n = hit.normal;
-                _reticleInstance.position = endPoint + n * reticleSurfaceOffset;
+                if (Vector3.Dot(dir, n) > 0f) n = -n;
+
+                // Offset reticle slightly toward the camera to avoid hiding behind the surface
+                Vector3 towardCam = (_mainCam != null)
+                    ? (_mainCam.transform.position - endPoint).normalized
+                    : -dir;
+
+                Vector3 pos = endPoint + towardCam * reticleSurfaceOffset;
+                pos -= dir.normalized * reticleDistanceOffset;
+                _reticleInstance.position = pos;
 
                 // Orientation: align to surface normal or face camera
                 if (reticleFaceCamera && _mainCam != null)
                 {
                     // Face camera (billboard)
-                    _reticleInstance.rotation = Quaternion.LookRotation(_reticleInstance.position - _mainCam.transform.position, Vector3.up);
+                    _reticleInstance.rotation = Quaternion.LookRotation( -(_reticleInstance.position - _mainCam.transform.position), Vector3.up);
+
                 }
                 else
                 {
