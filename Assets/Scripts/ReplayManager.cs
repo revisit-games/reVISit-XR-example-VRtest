@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 
+
 [System.Serializable]
 public class PositionSample
 {
@@ -64,6 +65,16 @@ public class ReplayManager : MonoBehaviour
     [Tooltip("If true, will interpolate between samples for smoother replay")]
     public bool interpolate = false;
 
+    // --- Public properties for external UI ---
+    public bool IsReplaying => isReplaying;
+    /// <summary>Current elapsed time in milliseconds since replay started.</summary>
+    public float ElapsedMs => isReplaying ? (Time.time - replayStartTime) * 1000f : 0f;
+    /// <summary>Total duration in milliseconds (calculated after data load).</summary>
+    public int TotalDurationMs { get; private set; } = 0;
+    /// <summary>Normalized 0¨C1 progress of the replay.</summary>
+    public float Progress01 => (TotalDurationMs > 0) ? Mathf.Clamp01(ElapsedMs / TotalDurationMs) : 0f;
+    // -----------------------------------------
+
     private TrajectorySaveData loadedData;
     private bool isReplaying = false;
     private float replayStartTime;
@@ -84,11 +95,31 @@ public class ReplayManager : MonoBehaviour
         {
             Debug.LogWarning("Replay file not found: " + path);
             loadedData = null;
+            TotalDurationMs = 0;
             return;
         }
         string json = File.ReadAllText(path);
         loadedData = JsonUtility.FromJson<TrajectorySaveData>(json);
         Debug.Log("Replay data loaded from: " + path);
+
+        // -------- Calculate the total duration by taking the max timeMs across all tracks --------
+        int maxMs = 0;
+        if (loadedData != null)
+        {
+            if (loadedData.objects != null)
+            {
+                foreach (var o in loadedData.objects)
+                    if (o != null && o.samples != null && o.samples.Count > 0)
+                        maxMs = Mathf.Max(maxMs, o.samples[o.samples.Count - 1].timeMs);
+            }
+            if (loadedData.cameras != null)
+            {
+                foreach (var c in loadedData.cameras)
+                    if (c != null && c.samples != null && c.samples.Count > 0)
+                        maxMs = Mathf.Max(maxMs, c.samples[c.samples.Count - 1].timeMs);
+            }
+        }
+        TotalDurationMs = Mathf.Max(0, maxMs);
     }
 
     /// <summary>
@@ -114,6 +145,47 @@ public class ReplayManager : MonoBehaviour
     public void StopReplay()
     {
         isReplaying = false;
+    }
+
+    /// <summary>
+    /// -------- Seeks the replay to the specified timestamp in milliseconds. --------
+    /// </summary>
+    public void SeekToMs(int targetMs)
+    {
+        if (loadedData == null) return;
+        targetMs = Mathf.Clamp(targetMs, 0, Mathf.Max(0, TotalDurationMs));
+
+        // Adjust replayStartTime so elapsedMs matches the requested timestamp
+        replayStartTime = Time.time - (targetMs / 1000f);
+
+        // Reset each track index to the closest sample at or before targetMs
+        if (replayIndices == null) replayIndices = new Dictionary<ReplayTarget, int>();
+        replayIndices.Clear();
+
+        foreach (var t in replayTargets)
+        {
+            int idx = 0;
+            if (t.isCamera)
+            {
+                var camData = loadedData.cameras.Find(c => c.cameraName == t.jsonName);
+                if (camData != null && camData.samples != null && camData.samples.Count > 0)
+                {
+                    // Find the last sample whose timeMs <= targetMs
+                    while (idx + 1 < camData.samples.Count && camData.samples[idx + 1].timeMs <= targetMs)
+                        idx++;
+                }
+            }
+            else
+            {
+                var objData = loadedData.objects.Find(o => o.objectName == t.jsonName);
+                if (objData != null && objData.samples != null && objData.samples.Count > 0)
+                {
+                    while (idx + 1 < objData.samples.Count && objData.samples[idx + 1].timeMs <= targetMs)
+                        idx++;
+                }
+            }
+            replayIndices[t] = idx;
+        }
     }
 
     void Update()
@@ -157,13 +229,14 @@ public class ReplayManager : MonoBehaviour
             {
                 var objData = loadedData.objects.Find(o => o.objectName == t.jsonName);
                 if (objData == null || objData.samples.Count == 0) continue;
+
                 int idx = replayIndices[t];
 
                 while (idx + 1 < objData.samples.Count && objData.samples[idx + 1].timeMs <= elapsedMs)
                     idx++;
                 replayIndices[t] = idx;
 
-                // Interpolation (optional)
+                // Interpolation
                 if (interpolate && idx + 1 < objData.samples.Count)
                 {
                     var a = objData.samples[idx];
