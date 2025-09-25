@@ -5,7 +5,9 @@ using TMPro;
 
 /// <summary>
 /// UI controller for displaying and scrubbing replay progress,
-/// and for swapping a state icon (before start / playing / paused).
+/// swapping a state icon (before start / playing / paused),
+/// and showing temporary icons for fast-forward / rewind based on timeline velocity.
+/// Also updates an optional status TMP text with "Playing", "Paused", "Fast Forward", "Rewind".
 /// Requires a ReplayManager reference in the scene.
 /// </summary>
 public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHandler
@@ -49,6 +51,43 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
     [Tooltip("Treat 'finished (progress ~1)' as Paused state.")]
     public bool finishedCountsAsPaused = true;
 
+    [Header("Fast Forward / Rewind Icons (optional)")]
+    [Tooltip("Sprite to show temporarily while fast-forwarding (timeline velocity above threshold).")]
+    public Sprite iconFastForward;
+
+    [Tooltip("Sprite to show temporarily while rewinding (timeline velocity below threshold).")]
+    public Sprite iconRewind;
+
+    [Tooltip("Velocity threshold (ms per second) above which we treat it as fast-forward.")]
+    public float velocityFFThreshold = 1200f;
+
+    [Tooltip("Velocity threshold (ms per second) below which we treat it as rewind.")]
+    public float velocityRWThreshold = -200f;
+
+    [Tooltip("How long (seconds) to keep the FF/RW icon visible after detecting an event.")]
+    public float ffRwHoldSeconds = 0.25f;
+
+    // ---------- NEW: Status text (TMP) ----------
+    [Header("Status Text (optional)")]
+    [Tooltip("Optional TMP text that shows current state text (Playing / Paused / Fast Forward / Rewind).")]
+    public TMP_Text statusLabel;
+
+    [Tooltip("Text shown while playing.")]
+    public string textPlaying = "Playing";
+
+    [Tooltip("Text shown while paused.")]
+    public string textPaused = "Paused";
+
+    [Tooltip("Text shown while fast-forwarding.")]
+    public string textFastForward = "Fast Forward";
+
+    [Tooltip("Text shown while rewinding.")]
+    public string textRewind = "Rewind";
+
+    [Tooltip("Text shown before any replay has started (can be empty).")]
+    public string textBeforeStart = "Ready";
+    // -------------------------------------------
+
     // Internal state
     private bool _isDragging = false;
     private bool _pointerHeldOnThis = false;
@@ -57,12 +96,16 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
     private bool _hasEverStarted = false;
     private float _lastProgress01 = 0f;
 
+    // FF/RW detection
+    private float _lastTimeMs = 0f;
+    private float _ffTimer = 0f;
+    private float _rwTimer = 0f;
+
     // A small epsilon for comparing near-end progress
     private const float kEndEpsilon = 0.999f;
 
     void Reset()
     {
-        // Try to auto-find a Slider on this GameObject or its children.
         if (slider == null) slider = GetComponentInChildren<Slider>();
     }
 
@@ -73,8 +116,6 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
             slider.minValue = 0f;
             slider.maxValue = 1f;
             slider.wholeNumbers = false;
-
-            // Observe value changes; when dragging, optionally seek in real-time.
             slider.onValueChanged.AddListener(OnSliderValueChanged);
         }
     }
@@ -82,9 +123,7 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
     void OnDestroy()
     {
         if (slider != null)
-        {
             slider.onValueChanged.RemoveListener(OnSliderValueChanged);
-        }
     }
 
     void Update()
@@ -97,6 +136,8 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
             slider.gameObject.SetActive(replayManager.IsReplaying);
             if (timeLabel != null)
                 timeLabel.gameObject.SetActive(replayManager.IsReplaying || updateLabelWhenIdle);
+            if (statusLabel != null)
+                statusLabel.gameObject.SetActive(true); // keep visible; content reflects state
         }
 
         // When not dragging, follow the replay progress
@@ -109,84 +150,161 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
         if (replayManager.IsReplaying) _hasEverStarted = true;
         _lastProgress01 = slider.value;
 
-        // Update time label
+        // Estimate current timeline time (ms) for velocity detection
+        float total = Mathf.Max(1, replayManager.TotalDurationMs);
+        float currentTimeMsEstimate = Mathf.Clamp01(slider.value) * total;
+
+        // Velocity ms/s
+        float dt = Mathf.Max(Time.deltaTime, 1e-6f);
+        float velocityMsPerSec = (currentTimeMsEstimate - _lastTimeMs) / dt;
+
+        if (velocityMsPerSec >= velocityFFThreshold && iconFastForward != null)
+            _ffTimer = ffRwHoldSeconds;
+        else
+            _ffTimer = Mathf.Max(0f, _ffTimer - dt);
+
+        if (velocityMsPerSec <= velocityRWThreshold && iconRewind != null)
+            _rwTimer = ffRwHoldSeconds;
+        else
+            _rwTimer = Mathf.Max(0f, _rwTimer - dt);
+
+        _lastTimeMs = currentTimeMsEstimate;
+
+        // Time label (mm:ss / mm:ss)
         if (timeLabel != null)
         {
-            int total = Mathf.Max(1, replayManager.TotalDurationMs);
-            int curMs = Mathf.RoundToInt(slider.value * total);
-            timeLabel.text = $"{FormatMs(curMs)} / {FormatMs(total)}";
+            int curMs = Mathf.RoundToInt(currentTimeMsEstimate);
+            timeLabel.text = $"{FormatMs(curMs)} / {FormatMs((int)total)}";
         }
 
-        // Update state icon
+        // Update visuals
         UpdateStateIcon();
+        UpdateStatusText(); // <<--- NEW
     }
 
     /// <summary>
-    /// Determine current visual state and swap the stateImage sprite if assigned.
-    /// We infer three states:
-    /// - BeforeStart: never started and progress is ~0
-    /// - Playing: ReplayManager.IsReplaying == true
-    /// - Paused: not playing but has started before (or finished if configured)
+    /// Decide current visual state and swap the stateImage sprite if assigned.
+    /// Priority: FF/RW (if timers active) > Playing > Paused > BeforeStart.
     /// </summary>
     private void UpdateStateIcon()
     {
-        if (stateImage == null) return;
+        if (stateImage == null || replayManager == null) return;
 
-        // Decide state
-        bool isPlaying = replayManager != null && replayManager.IsReplaying;
         bool nearStart = _lastProgress01 <= 0.0001f;
         bool nearEnd = _lastProgress01 >= kEndEpsilon;
+
+        bool isReplaying = replayManager.IsReplaying; // true for both playing and paused
+        bool isPaused = isReplaying && HasPropertyIsPausedTrue();
+        bool isPlaying = isReplaying && !isPaused;
+
+        if (_ffTimer > 0f && iconFastForward != null)
+        {
+            if (stateImage.sprite != iconFastForward) stateImage.sprite = iconFastForward;
+            return;
+        }
+        if (_rwTimer > 0f && iconRewind != null)
+        {
+            if (stateImage.sprite != iconRewind) stateImage.sprite = iconRewind;
+            return;
+        }
 
         Sprite target = null;
 
         if (!_hasEverStarted && nearStart)
         {
-            // Before start
             target = iconBeforeStart != null ? iconBeforeStart : stateImage.sprite;
         }
         else if (isPlaying)
         {
-            // Playing
             target = iconPlaying != null ? iconPlaying : stateImage.sprite;
+        }
+        else if (isPaused)
+        {
+            target = iconPaused != null ? iconPaused : stateImage.sprite;
         }
         else
         {
-            // Not playing: either paused mid-way, or (optionally) finished
-            if (nearEnd && !finishedCountsAsPaused)
-            {
-                // If you don't want "finished" to be treated as paused,
-                // you can fall back to the "before start" icon or keep current.
-                target = iconBeforeStart != null ? iconBeforeStart : stateImage.sprite;
-            }
-            else
-            {
-                // Paused (or finished if opted-in)
+            if (nearEnd && finishedCountsAsPaused)
                 target = iconPaused != null ? iconPaused : stateImage.sprite;
-            }
+            else
+                target = iconBeforeStart != null ? iconBeforeStart : stateImage.sprite;
         }
 
-        if (stateImage.sprite != target && target != null)
+        if (target != null && stateImage.sprite != target)
             stateImage.sprite = target;
     }
 
+    // ---------- NEW: status text updater ----------
     /// <summary>
-    /// Public API: Call this from EventTrigger (BeginDrag) if you prefer explicit wiring.
+    /// Updates the optional TMP status label with "Playing", "Paused", "Fast Forward", "Rewind" (or "Ready" before start).
+    /// Priority: FF/RW text > Playing > Paused > BeforeStart.
     /// </summary>
+    private void UpdateStatusText()
+    {
+        if (statusLabel == null || replayManager == null) return;
+
+        bool nearStart = _lastProgress01 <= 0.0001f;
+        bool nearEnd = _lastProgress01 >= kEndEpsilon;
+
+        bool isReplaying = replayManager.IsReplaying;
+        bool isPaused = isReplaying && HasPropertyIsPausedTrue();
+        bool isPlaying = isReplaying && !isPaused;
+
+        // FF/RW take precedence while their timers are active
+        if (_ffTimer > 0f)
+        {
+            statusLabel.text = textFastForward;
+            return;
+        }
+        if (_rwTimer > 0f)
+        {
+            statusLabel.text = textRewind;
+            return;
+        }
+
+        if (!_hasEverStarted && nearStart)
+        {
+            statusLabel.text = textBeforeStart;
+        }
+        else if (isPlaying)
+        {
+            statusLabel.text = textPlaying;
+        }
+        else if (isPaused)
+        {
+            statusLabel.text = textPaused;
+        }
+        else
+        {
+            // Stopped: choose paused at end (if configured) or before-start text
+            statusLabel.text = (nearEnd && finishedCountsAsPaused) ? textPaused : textBeforeStart;
+        }
+    }
+    // ----------------------------------------------
+
+    /// <summary>
+    /// Try to read ReplayManager.IsPaused if available; fallback to false if the property does not exist.
+    /// </summary>
+    private bool HasPropertyIsPausedTrue()
+    {
+        try
+        {
+            return (bool)replayManager.GetType().GetProperty("IsPaused")?.GetValue(replayManager, null) == true;
+        }
+        catch { return false; }
+    }
+
     public void BeginDrag()
     {
         if (!allowScrub) return;
         _isDragging = true;
     }
 
-    /// <summary>
-    /// Public API: Call this from EventTrigger (EndDrag) if you prefer explicit wiring.
-    /// </summary>
     public void EndDrag()
     {
         if (!allowScrub) return;
         _isDragging = false;
 
-        // Final seek on release if we do not seek continuously
         if (!seekWhileDragging && replayManager != null)
         {
             int targetMs = Mathf.RoundToInt(slider.value * replayManager.TotalDurationMs);
@@ -194,10 +312,6 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
         }
     }
 
-    /// <summary>
-    /// IPointerDownHandler: Begin dragging when the pointer presses on this UI.
-    /// Works for mouse, touch, and XR/UI pointer events.
-    /// </summary>
     public void OnPointerDown(PointerEventData eventData)
     {
         if (!allowScrub) return;
@@ -206,7 +320,6 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
 
         if (!seekWhileDragging) return;
 
-        // Immediate seek to the pointer-down value
         if (replayManager != null)
         {
             int targetMs = Mathf.RoundToInt(slider.value * replayManager.TotalDurationMs);
@@ -214,16 +327,12 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
         }
     }
 
-    /// <summary>
-    /// IPointerUpHandler: Finish dragging on pointer release.
-    /// </summary>
     public void OnPointerUp(PointerEventData eventData)
     {
         if (!allowScrub) return;
         _pointerHeldOnThis = false;
         _isDragging = false;
 
-        // Seek once on release if not seeking continuously
         if (!seekWhileDragging && replayManager != null)
         {
             int targetMs = Mathf.RoundToInt(slider.value * replayManager.TotalDurationMs);
@@ -231,9 +340,6 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
         }
     }
 
-    /// <summary>
-    /// Slider callback. When dragging, optionally seek continuously.
-    /// </summary>
     private void OnSliderValueChanged(float v)
     {
         if (!allowScrub || !seekWhileDragging) return;
@@ -244,9 +350,6 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
         replayManager.SeekToMs(targetMs);
     }
 
-    /// <summary>
-    /// Formats milliseconds as mm:ss (rounded to the nearest second).
-    /// </summary>
     private string FormatMs(int ms)
     {
         int totalSec = Mathf.RoundToInt(ms / 1000f);
@@ -255,23 +358,16 @@ public class ReplayProgressUI : MonoBehaviour, IPointerDownHandler, IPointerUpHa
         return $"{m:00}:{s:00}";
     }
 
-    // ---------- Optional convenience methods ----------
-
-    /// <summary>
-    /// Programmatically set the slider without triggering a seek (e.g., external UI sync).
-    /// </summary>
+    // Optional helpers
     public void SetSliderSilently(float normalizedValue)
     {
         if (slider == null) return;
         var prev = slider.onValueChanged;
-        slider.onValueChanged = new Slider.SliderEvent(); // temporarily detach
+        slider.onValueChanged = new Slider.SliderEvent();
         slider.value = Mathf.Clamp01(normalizedValue);
-        slider.onValueChanged = prev; // restore
+        slider.onValueChanged = prev;
     }
 
-    /// <summary>
-    /// Jumps to the given normalized position [0..1] and seeks immediately.
-    /// </summary>
     public void JumpTo(float normalizedValue01)
     {
         if (replayManager == null || slider == null) return;

@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 
-
 [System.Serializable]
 public class PositionSample
 {
@@ -65,19 +64,43 @@ public class ReplayManager : MonoBehaviour
     [Tooltip("If true, will interpolate between samples for smoother replay")]
     public bool interpolate = false;
 
-    // --- Public properties for external UI ---
+    // --- Public properties for external UI/controls ---
     public bool IsReplaying => isReplaying;
-    /// <summary>Current elapsed time in milliseconds since replay started.</summary>
-    public float ElapsedMs => isReplaying ? (Time.time - replayStartTime) * 1000f : 0f;
+    public bool IsPaused => isPaused;
+
+    /// <summary>Current timeline time in milliseconds (clamped to [0, TotalDurationMs]).</summary>
+    public float CurrentTimeMs
+    {
+        get
+        {
+            float ms;
+            if (!isReplaying) ms = 0f;
+            else ms = isPaused ? pausedAtMs : (Time.time - replayStartTime) * 1000f;
+            return Mathf.Clamp(ms, 0f, TotalDurationMs);
+        }
+    }
+
+    /// <summary>Current elapsed time in milliseconds since replay started (same as CurrentTimeMs).</summary>
+    public float ElapsedMs => CurrentTimeMs;
+
     /// <summary>Total duration in milliseconds (calculated after data load).</summary>
     public int TotalDurationMs { get; private set; } = 0;
+
     /// <summary>Normalized 0¨C1 progress of the replay.</summary>
-    public float Progress01 => (TotalDurationMs > 0) ? Mathf.Clamp01(ElapsedMs / TotalDurationMs) : 0f;
-    // -----------------------------------------
+    public float Progress01 => (TotalDurationMs > 0) ? Mathf.Clamp01(CurrentTimeMs / TotalDurationMs) : 0f;
+    // ---------------------------------------------------
 
     private TrajectorySaveData loadedData;
     private bool isReplaying = false;
+    private bool isPaused = false;
+
+    // When playing: Time.time at which replay "time 0" started.
     private float replayStartTime;
+
+    // When paused: timeline time at which we paused (ms).
+    private float pausedAtMs = 0f;
+
+    // Per-target sample indices cache
     private Dictionary<ReplayTarget, int> replayIndices = new Dictionary<ReplayTarget, int>();
 
     void Start()
@@ -102,7 +125,7 @@ public class ReplayManager : MonoBehaviour
         loadedData = JsonUtility.FromJson<TrajectorySaveData>(json);
         Debug.Log("Replay data loaded from: " + path);
 
-        // -------- Calculate the total duration by taking the max timeMs across all tracks --------
+        // Calculate total duration as the max last sample time across all tracks
         int maxMs = 0;
         if (loadedData != null)
         {
@@ -120,10 +143,16 @@ public class ReplayManager : MonoBehaviour
             }
         }
         TotalDurationMs = Mathf.Max(0, maxMs);
+
+        // Reset state
+        isReplaying = false;
+        isPaused = false;
+        pausedAtMs = 0f;
+        replayIndices.Clear();
     }
 
     /// <summary>
-    /// Starts the replay. All targets will follow their recorded trajectories.
+    /// Starts the replay from the beginning (sets time to 0).
     /// </summary>
     public void StartReplay()
     {
@@ -133,32 +162,71 @@ public class ReplayManager : MonoBehaviour
             return;
         }
         isReplaying = true;
-        replayStartTime = Time.time;
+        isPaused = false;
+        pausedAtMs = 0f;
+        replayStartTime = Time.time; // play from t=0
         replayIndices.Clear();
         foreach (var t in replayTargets)
             replayIndices[t] = 0;
     }
 
     /// <summary>
-    /// Stops the replay.
+    /// Stops the replay (not paused; timeline resets to 0).
     /// </summary>
     public void StopReplay()
     {
         isReplaying = false;
+        isPaused = false;
+        pausedAtMs = 0f;
+    }
+
+    /// <summary>Pause the replay at the current timeline time.</summary>
+    public void PauseReplay()
+    {
+        if (!isReplaying || isPaused) return;
+        pausedAtMs = (Time.time - replayStartTime) * 1000f;
+        pausedAtMs = Mathf.Clamp(pausedAtMs, 0f, TotalDurationMs);
+        isPaused = true;
+    }
+
+    /// <summary>Resume the replay from the paused timeline time.</summary>
+    public void ResumeReplay()
+    {
+        if (!isReplaying || !isPaused) return;
+        // Shift start time so that CurrentTimeMs continues from pausedAtMs
+        replayStartTime = Time.time - (pausedAtMs / 1000f);
+        isPaused = false;
+    }
+
+    /// <summary>Toggle between paused and playing.</summary>
+    public void TogglePause()
+    {
+        if (!isReplaying) return;
+        if (isPaused) ResumeReplay();
+        else PauseReplay();
     }
 
     /// <summary>
-    /// -------- Seeks the replay to the specified timestamp in milliseconds. --------
+    /// Seeks the replay to the specified timestamp in milliseconds.
+    /// Works in both playing and paused states.
     /// </summary>
     public void SeekToMs(int targetMs)
     {
         if (loadedData == null) return;
         targetMs = Mathf.Clamp(targetMs, 0, Mathf.Max(0, TotalDurationMs));
 
-        // Adjust replayStartTime so elapsedMs matches the requested timestamp
-        replayStartTime = Time.time - (targetMs / 1000f);
+        if (isPaused)
+        {
+            // When paused: just set pausedAtMs and keep paused
+            pausedAtMs = targetMs;
+        }
+        else
+        {
+            // When playing: adjust replayStartTime so elapsed aligns to target
+            replayStartTime = Time.time - (targetMs / 1000f);
+        }
 
-        // Reset each track index to the closest sample at or before targetMs
+        // Rebuild per-track indices to <= targetMs
         if (replayIndices == null) replayIndices = new Dictionary<ReplayTarget, int>();
         replayIndices.Clear();
 
@@ -170,7 +238,6 @@ public class ReplayManager : MonoBehaviour
                 var camData = loadedData.cameras.Find(c => c.cameraName == t.jsonName);
                 if (camData != null && camData.samples != null && camData.samples.Count > 0)
                 {
-                    // Find the last sample whose timeMs <= targetMs
                     while (idx + 1 < camData.samples.Count && camData.samples[idx + 1].timeMs <= targetMs)
                         idx++;
                 }
@@ -188,11 +255,23 @@ public class ReplayManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Nudge the timeline by a signed amount of seconds. Positive = forward, negative = backward.
+    /// Safe to call every frame while a hotkey is held.
+    /// </summary>
+    public void NudgeBySeconds(float seconds)
+    {
+        if (loadedData == null || !isReplaying) return;
+        int targetMs = Mathf.RoundToInt(CurrentTimeMs + seconds * 1000f);
+        SeekToMs(targetMs);
+    }
+
     void Update()
     {
         if (!isReplaying || loadedData == null) return;
 
-        float elapsedMs = (Time.time - replayStartTime) * 1000f;
+        // Use CurrentTimeMs so that both playing and paused modes are supported
+        float elapsedMs = CurrentTimeMs;
 
         foreach (var t in replayTargets)
         {
@@ -202,7 +281,8 @@ public class ReplayManager : MonoBehaviour
             {
                 var camData = loadedData.cameras.Find(c => c.cameraName == t.jsonName);
                 if (camData == null || camData.samples.Count == 0) continue;
-                int idx = replayIndices[t];
+
+                int idx = replayIndices.ContainsKey(t) ? replayIndices[t] : 0;
 
                 // Advance to the latest sample whose timeMs <= elapsedMs
                 while (idx + 1 < camData.samples.Count && camData.samples[idx + 1].timeMs <= elapsedMs)
@@ -230,13 +310,13 @@ public class ReplayManager : MonoBehaviour
                 var objData = loadedData.objects.Find(o => o.objectName == t.jsonName);
                 if (objData == null || objData.samples.Count == 0) continue;
 
-                int idx = replayIndices[t];
+                int idx = replayIndices.ContainsKey(t) ? replayIndices[t] : 0;
 
                 while (idx + 1 < objData.samples.Count && objData.samples[idx + 1].timeMs <= elapsedMs)
                     idx++;
                 replayIndices[t] = idx;
 
-                // Interpolation
+                // Interpolation (optional)
                 if (interpolate && idx + 1 < objData.samples.Count)
                 {
                     var a = objData.samples[idx];
