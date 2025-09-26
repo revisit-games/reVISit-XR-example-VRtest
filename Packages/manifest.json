@@ -3,6 +3,7 @@
     "com.meta.xr.sdk.core": "78.0.0",
     "com.meta.xr.sdk.interaction.ovr": "78.0.0",
     "com.meta.xr.simulator": "78.0.0",
+    "com.monitor1394.xcharts": "https://github.com/XCharts-Team/XCharts.git",
     "com.unity.2d.sprite": "1.0.0",
     "com.unity.collab-proxy": "2.9.3",
     "com.unity.ide.rider": "3.0.34",
