@@ -2,7 +2,9 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
+using XCharts.Runtime; // NEW: XCharts
 
+// ---------- Existing data models (objects/cameras) ----------
 [System.Serializable]
 public class PositionSample
 {
@@ -32,11 +34,37 @@ public class CameraTrajectory
     public List<CameraSample> samples = new List<CameraSample>();
 }
 
+// ---------- NEW: charts data models (must match Save output) ----------
+[System.Serializable]
+public class ChartValueSample
+{
+    public float value;
+    public int timeMs;
+}
+
+[System.Serializable]
+public class ChartPointSeries
+{
+    public int dataIndex; // point index inside the serie
+    public List<ChartValueSample> samples = new List<ChartValueSample>();
+}
+
+[System.Serializable]
+public class ChartSerieTrajectory
+{
+    public string chartName;      // e.g., "LineChart"
+    public int serieIndex;        // e.g., 0
+    public List<ChartPointSeries> points = new List<ChartPointSeries>();
+}
+
 [System.Serializable]
 public class TrajectorySaveData
 {
     public List<ObjectTrajectory> objects = new List<ObjectTrajectory>();
     public List<CameraTrajectory> cameras = new List<CameraTrajectory>();
+
+    // NEW: charts block
+    public List<ChartSerieTrajectory> charts = new List<ChartSerieTrajectory>();
 }
 
 [System.Serializable]
@@ -44,24 +72,60 @@ public class ReplayTarget
 {
     [Tooltip("The name of the object/camera in the JSON file (objectName or cameraName)")]
     public string jsonName;
+
     [Tooltip("The GameObject in the scene to replay the trajectory")]
     public GameObject target;
+
     [Tooltip("Is this a camera (position + forward) or a normal object (position only)?")]
     public bool isCamera;
 }
 
+// ---------- NEW: chart binding (scene LineChart <-> JSON name/serie) ----------
+[System.Serializable]
+public class ChartReplayBinding
+{
+    [Header("Match JSON")]
+    [Tooltip("JSON chartName (defaults to the LineChart GameObject name if empty).")]
+    public string jsonChartNameOverride;
+
+    [Tooltip("Which serieIndex in that chart to replay (0 = 'Serie 0').")]
+    public int serieIndex = 0;
+
+    [Header("Scene")]
+    [Tooltip("Scene LineChart component to drive.")]
+    public LineChart chart;
+
+    [Header("Options")]
+    [Tooltip("If true, when the serie does not have enough points, add data rows automatically.")]
+    public bool autoCreateMissingPoints = true;
+
+    [Tooltip("Interpolate values between samples for smoother curves.")]
+    public bool interpolateValues = true;
+
+    // ---- runtime caches ----
+    [System.NonSerialized] public ChartSerieTrajectory matchedData;
+    [System.NonSerialized] public Dictionary<int, int> pointIndices = new Dictionary<int, int>(); // per dataIndex -> current sample idx
+}
+
 public class ReplayManager : MonoBehaviour
 {
-    [Header("Replay Targets")]
+    [Header("Replay Targets (Objects / Cameras)")]
     [Tooltip("List of GameObjects to replay, and their corresponding JSON names")]
     public List<ReplayTarget> replayTargets = new List<ReplayTarget>();
+
+    [Header("Charts Replay")]
+    [Tooltip("Bind scene LineCharts to JSON chart data by name + serieIndex.")]
+    public List<ChartReplayBinding> chartBindings = new List<ChartReplayBinding>();
+
+    [Tooltip("Call chart.RefreshChart() each frame after applying updates.")]
+    public bool refreshChartsEachFrame = true;
 
     [Header("Replay Data File")]
     [Tooltip("The JSON file name to load from /Saves/")]
     public string replayFileName = "save_1.json";
 
-    [Header("Replay Settings")]
-    [Tooltip("If true, will interpolate between samples for smoother replay")]
+    [Header("Replay Settings (Objects/Cameras)")]
+    [Tooltip("If true, will interpolate between samples for smoother replay of objects/cameras")]
     public bool interpolate = false;
 
     // --- Public properties for external UI/controls ---
@@ -100,7 +164,7 @@ public class ReplayManager : MonoBehaviour
     // When paused: timeline time at which we paused (ms).
     private float pausedAtMs = 0f;
 
-    // Per-target sample indices cache
+    // Per-target sample indices cache (objects/cameras)
     private Dictionary<ReplayTarget, int> replayIndices = new Dictionary<ReplayTarget, int>();
 
     void Start()
@@ -141,6 +205,17 @@ public class ReplayManager : MonoBehaviour
                     if (c != null && c.samples != null && c.samples.Count > 0)
                         maxMs = Mathf.Max(maxMs, c.samples[c.samples.Count - 1].timeMs);
             }
+            // NEW: charts duration
+            if (loadedData.charts != null)
+            {
+                foreach (var ch in loadedData.charts)
+                {
+                    if (ch?.points == null) continue;
+                    foreach (var p in ch.points)
+                        if (p?.samples != null && p.samples.Count > 0)
+                            maxMs = Mathf.Max(maxMs, p.samples[p.samples.Count - 1].timeMs);
+                }
+            }
         }
         TotalDurationMs = Mathf.Max(0, maxMs);
 
@@ -149,6 +224,71 @@ public class ReplayManager : MonoBehaviour
         isPaused = false;
         pausedAtMs = 0f;
         replayIndices.Clear();
+
+        // Prepare chart bindings: match JSON block by name+serie, init indices, ensure data rows
+        PrepareChartBindings();
+    }
+
+    /// <summary>
+    /// Map chartBindings to loadedData.charts and setup per-point indices.
+    /// </summary>
+    private void PrepareChartBindings()
+    {
+        if (loadedData == null || chartBindings == null) return;
+
+        foreach (var b in chartBindings)
+        {
+            b.matchedData = null;
+            b.pointIndices.Clear();
+            if (b.chart == null) continue;
+
+            string wantName = string.IsNullOrEmpty(b.jsonChartNameOverride)
+                ? b.chart.gameObject.name
+                : b.jsonChartNameOverride;
+
+            // find chart serie block in data
+            var block = loadedData.charts?.Find(ch =>
+                ch != null &&
+                ch.serieIndex == b.serieIndex &&
+                ch.chartName == wantName);
+
+            if (block == null)
+            {
+                Debug.LogWarning($"[Replay][Charts] No chart data found for '{wantName}' serieIndex={b.serieIndex}");
+                continue;
+            }
+
+            b.matchedData = block;
+
+            // Ensure the serie has enough points
+            var serie = b.chart.GetSerie(b.serieIndex);
+            if (serie == null)
+            {
+                Debug.LogWarning($"[Replay][Charts] LineChart has no serie at index {b.serieIndex}.");
+                continue;
+            }
+
+            // Find max dataIndex we will touch
+            int maxIdx = -1;
+            foreach (var p in block.points)
+                if (p != null) maxIdx = Mathf.Max(maxIdx, p.dataIndex);
+
+            if (b.autoCreateMissingPoints && maxIdx >= 0)
+            {
+                while (serie.dataCount <= maxIdx)
+                {
+                    // Add data rows as (x = dataCount, y = 0 by default)
+                    b.chart.AddData(b.serieIndex, serie.dataCount, 0);
+                }
+            }
+
+            // init per-point indices
+            foreach (var p in block.points)
+            {
+                if (p == null || p.samples == null || p.samples.Count == 0) continue;
+                b.pointIndices[p.dataIndex] = 0;
+            }
+        }
     }
 
     /// <summary>
@@ -168,6 +308,16 @@ public class ReplayManager : MonoBehaviour
         replayIndices.Clear();
         foreach (var t in replayTargets)
             replayIndices[t] = 0;
+
+        // Reset chart per-point indices to 0
+        foreach (var b in chartBindings)
+        {
+            if (b?.matchedData == null) continue;
+            b.pointIndices.Clear();
+            foreach (var p in b.matchedData.points)
+                if (p?.samples != null && p.samples.Count > 0)
+                    b.pointIndices[p.dataIndex] = 0;
+        }
     }
 
     /// <summary>
@@ -209,6 +359,7 @@ public class ReplayManager : MonoBehaviour
     /// <summary>
     /// Seeks the replay to the specified timestamp in milliseconds.
     /// Works in both playing and paused states.
+    /// Also reseeks chart sample indices.
     /// </summary>
     public void SeekToMs(int targetMs)
     {
@@ -226,7 +377,7 @@ public class ReplayManager : MonoBehaviour
             replayStartTime = Time.time - (targetMs / 1000f);
         }
 
-        // Rebuild per-track indices to <= targetMs
+        // Rebuild per-track indices to <= targetMs (objects/cameras)
         if (replayIndices == null) replayIndices = new Dictionary<ReplayTarget, int>();
         replayIndices.Clear();
 
@@ -253,6 +404,20 @@ public class ReplayManager : MonoBehaviour
             }
             replayIndices[t] = idx;
         }
+
+        // Reseek chart per-point indices
+        foreach (var b in chartBindings)
+        {
+            if (b?.matchedData == null) continue;
+            foreach (var p in b.matchedData.points)
+            {
+                if (p?.samples == null || p.samples.Count == 0) continue;
+                int idx = 0;
+                while (idx + 1 < p.samples.Count && p.samples[idx + 1].timeMs <= targetMs)
+                    idx++;
+                b.pointIndices[p.dataIndex] = idx;
+            }
+        }
     }
 
     /// <summary>
@@ -273,6 +438,7 @@ public class ReplayManager : MonoBehaviour
         // Use CurrentTimeMs so that both playing and paused modes are supported
         float elapsedMs = CurrentTimeMs;
 
+        // ---------- A) Objects / Cameras ----------
         foreach (var t in replayTargets)
         {
             if (t.target == null || string.IsNullOrEmpty(t.jsonName)) continue;
@@ -330,6 +496,71 @@ public class ReplayManager : MonoBehaviour
                     t.target.transform.position = sample.position;
                 }
             }
+        }
+
+        // ---------- B) Charts (SerieData values) ----------
+        bool anyChartUpdated = false;
+
+        foreach (var b in chartBindings)
+        {
+            if (b == null || b.chart == null || b.matchedData == null) continue;
+
+            // Ensure serie exists
+            var serie = b.chart.GetSerie(b.serieIndex);
+            if (serie == null) continue;
+
+            foreach (var p in b.matchedData.points)
+            {
+                if (p?.samples == null || p.samples.Count == 0) continue;
+
+                // Ensure the serie has enough data rows
+                if (b.autoCreateMissingPoints)
+                {
+                    while (serie.dataCount <= p.dataIndex)
+                        b.chart.AddData(b.serieIndex, serie.dataCount, 0);
+                }
+                if (p.dataIndex < 0 || p.dataIndex >= serie.dataCount) continue;
+
+                // Advance index
+                int idx = 0;
+                if (b.pointIndices.TryGetValue(p.dataIndex, out idx))
+                {
+                    while (idx + 1 < p.samples.Count && p.samples[idx + 1].timeMs <= elapsedMs)
+                        idx++;
+                    b.pointIndices[p.dataIndex] = idx;
+                }
+                else
+                {
+                    // first use
+                    while (idx + 1 < p.samples.Count && p.samples[idx + 1].timeMs <= elapsedMs)
+                        idx++;
+                    b.pointIndices[p.dataIndex] = idx;
+                }
+
+                float value;
+                if (b.interpolateValues && idx + 1 < p.samples.Count)
+                {
+                    var a = p.samples[idx];
+                    var c = p.samples[idx + 1];
+                    float tLerp = Mathf.InverseLerp(a.timeMs, c.timeMs, elapsedMs);
+                    value = Mathf.Lerp(a.value, c.value, tLerp);
+                }
+                else
+                {
+                    value = p.samples[b.pointIndices[p.dataIndex]].value;
+                }
+
+                // Write Y (dimension 1)
+                b.chart.UpdateData(b.serieIndex, p.dataIndex, 1, value);
+                anyChartUpdated = true;
+            }
+        }
+
+        if (anyChartUpdated && refreshChartsEachFrame)
+        {
+            // If you have many charts, you may cache unique charts and refresh once each.
+            foreach (var b in chartBindings)
+                if (b?.chart != null) b.chart.RefreshChart();
         }
     }
 }
