@@ -1,17 +1,37 @@
 using System.IO;
 using System.Collections.Generic;
 using UnityEngine;
-using XCharts.Runtime; // <¡ª NEW: XCharts runtime API
+using XCharts.Runtime; // XCharts runtime API
 
 public class Save : MonoBehaviour
 {
     #region === Inspector: Objects & Cameras ===
 
+    [System.Serializable]
+    public class ObjectRecordTarget
+    {
+        [Tooltip("The GameObject to record (position only).")]
+        public GameObject target;
+
+        [Tooltip("Optional JSON name override. If empty, target.name will be used.")]
+        public string jsonNameOverride = "";
+    }
+
+    [System.Serializable]
+    public class CameraRecordTarget
+    {
+        [Tooltip("The Camera/Pointer GameObject to record (position + forward).")]
+        public GameObject target;
+
+        [Tooltip("Optional JSON name override. If empty, target.name will be used.")]
+        public string jsonNameOverride = "";
+    }
+
     [Header("Normal GameObjects To Record (Position Data)")]
-    [SerializeField] private List<GameObject> targets = new List<GameObject>();
+    [SerializeField] private List<ObjectRecordTarget> targets = new List<ObjectRecordTarget>();
 
     [Header("Cameras (or Pointers) To Record (Position & Forward Data)")]
-    [SerializeField] private List<GameObject> cameras = new List<GameObject>();
+    [SerializeField] private List<CameraRecordTarget> cameras = new List<CameraRecordTarget>();
 
     [Header("Record Threshold Settings")]
     [SerializeField] private float objectPositionThreshold = 0.04f;
@@ -48,11 +68,11 @@ public class Save : MonoBehaviour
 
     #region === Runtime state ===
 
-    // Object position history
+    // Object position history (key = json name key)
     private Dictionary<string, List<PositionSample>> positionHistory = new Dictionary<string, List<PositionSample>>();
     private Dictionary<string, Vector3> lastPosition = new Dictionary<string, Vector3>();
 
-    // Camera history
+    // Camera history (key = json name key)
     private Dictionary<string, List<CameraSample>> cameraHistory = new Dictionary<string, List<CameraSample>>();
     private Dictionary<string, Vector3> lastCameraPosition = new Dictionary<string, Vector3>();
     private Dictionary<string, Vector3> lastCameraForward = new Dictionary<string, Vector3>();
@@ -83,53 +103,56 @@ public class Save : MonoBehaviour
 
         int timeMs = (int)((Time.time - startTime) * 1000);
 
-        // ---------- 1) Normal GameObjects ----------
-        foreach (var go in targets)
+        // ---------- 1) Normal GameObjects (position only) ----------
+        foreach (var entry in targets)
         {
-            if (go == null) continue;
-            Vector3 current = go.transform.position;
-            if (!lastPosition.ContainsKey(go.name) ||
-                ExceedThresholdVec3(current, lastPosition[go.name], objectPositionThreshold))
-            {
-                if (!positionHistory.ContainsKey(go.name))
-                    positionHistory[go.name] = new List<PositionSample>();
+            if (entry == null || entry.target == null) continue;
+            string key = GetObjectKey(entry);
+            Vector3 current = entry.target.transform.position;
 
-                positionHistory[go.name].Add(new PositionSample { position = current, timeMs = timeMs });
-                lastPosition[go.name] = current;
+            if (!lastPosition.ContainsKey(key) ||
+                ExceedThresholdVec3(current, lastPosition[key], objectPositionThreshold))
+            {
+                if (!positionHistory.ContainsKey(key))
+                    positionHistory[key] = new List<PositionSample>();
+
+                positionHistory[key].Add(new PositionSample { position = current, timeMs = timeMs });
+                lastPosition[key] = current;
             }
         }
 
-        // ---------- 2) Cameras (position + forward) ----------
-        foreach (var cam in cameras)
+        // ---------- 2) Cameras / Pointers (position + forward) ----------
+        foreach (var entry in cameras)
         {
-            if (cam == null) continue;
+            if (entry == null || entry.target == null) continue;
+            string key = GetCameraKey(entry);
 
-            Vector3 currentPos = cam.transform.position;
-            Vector3 currentFwd = cam.transform.forward;
+            Vector3 currentPos = entry.target.transform.position;
+            Vector3 currentFwd = entry.target.transform.forward;
 
             bool needRecord = false;
-            if (!lastCameraPosition.ContainsKey(cam.name) ||
-                ExceedThresholdVec3(currentPos, lastCameraPosition[cam.name], cameraPositionThreshold))
+            if (!lastCameraPosition.ContainsKey(key) ||
+                ExceedThresholdVec3(currentPos, lastCameraPosition[key], cameraPositionThreshold))
                 needRecord = true;
 
-            if (!lastCameraForward.ContainsKey(cam.name) ||
-                ExceedThresholdVec3(currentFwd, lastCameraForward[cam.name], cameraForwardThreshold))
+            if (!lastCameraForward.ContainsKey(key) ||
+                ExceedThresholdVec3(currentFwd, lastCameraForward[key], cameraForwardThreshold))
                 needRecord = true;
 
             if (needRecord)
             {
-                if (!cameraHistory.ContainsKey(cam.name))
-                    cameraHistory[cam.name] = new List<CameraSample>();
+                if (!cameraHistory.ContainsKey(key))
+                    cameraHistory[key] = new List<CameraSample>();
 
-                cameraHistory[cam.name].Add(new CameraSample
+                cameraHistory[key].Add(new CameraSample
                 {
                     position = currentPos,
                     forward = currentFwd,
                     timeMs = timeMs
                 });
 
-                lastCameraPosition[cam.name] = currentPos;
-                lastCameraForward[cam.name] = currentFwd;
+                lastCameraPosition[key] = currentPos;
+                lastCameraForward[key] = currentFwd;
             }
         }
 
@@ -197,20 +220,21 @@ public class Save : MonoBehaviour
         // 1) Objects
         positionHistory.Clear();
         lastPosition.Clear();
-        foreach (var go in targets)
-            if (go != null) positionHistory[go.name] = new List<PositionSample>();
+        foreach (var entry in targets)
+            if (entry != null && entry.target != null)
+                positionHistory[GetObjectKey(entry)] = new List<PositionSample>();
 
         // 2) Cameras
         cameraHistory.Clear();
         lastCameraPosition.Clear();
         lastCameraForward.Clear();
-        foreach (var cam in cameras)
-            if (cam != null) cameraHistory[cam.name] = new List<CameraSample>();
+        foreach (var entry in cameras)
+            if (entry != null && entry.target != null)
+                cameraHistory[GetCameraKey(entry)] = new List<CameraSample>();
 
         // 3) Charts
         chartHistory.Clear();
-        lastChartValues.Clear();
-        // (no prefill needed; will create on the fly during Update)
+        lastChartValues.Clear(); // will be created on the fly
 
         isRecording = true;
         startTime = Time.time;
@@ -245,6 +269,16 @@ public class Save : MonoBehaviour
         var list = new List<int>(count);
         for (int i = 0; i < count; i++) list.Add(i);
         return list;
+    }
+
+    private static string GetObjectKey(ObjectRecordTarget entry)
+    {
+        return string.IsNullOrEmpty(entry.jsonNameOverride) ? entry.target.name : entry.jsonNameOverride;
+    }
+
+    private static string GetCameraKey(CameraRecordTarget entry)
+    {
+        return string.IsNullOrEmpty(entry.jsonNameOverride) ? entry.target.name : entry.jsonNameOverride;
     }
 
     #endregion
@@ -346,7 +380,7 @@ public class Save : MonoBehaviour
         public List<CameraSample> samples = new List<CameraSample>();
     }
 
-    // ---- NEW: Charts ----
+    // ---- Charts ----
 
     [System.Serializable]
     public class ChartValueSample
@@ -376,7 +410,7 @@ public class Save : MonoBehaviour
         public List<ObjectTrajectory> objects = new List<ObjectTrajectory>();
         public List<CameraTrajectory> cameras = new List<CameraTrajectory>();
 
-        // NEW block for charts
+        // Block for charts
         public List<ChartSerieTrajectory> charts = new List<ChartSerieTrajectory>();
     }
 
