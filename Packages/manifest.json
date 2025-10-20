@@ -1,5 +1,8 @@
 {
   "dependencies": {
+    "com.de-panther.webxr": "0.22.1",
+    "com.de-panther.webxr-input-profiles-loader": "0.6.2",
+    "com.de-panther.webxr-interactions": "0.22.0",
     "com.meta.xr.sdk.core": "78.0.0",
     "com.meta.xr.sdk.interaction.ovr": "78.0.0",
     "com.meta.xr.simulator": "78.0.0",
@@ -50,5 +53,14 @@
     "com.unity.modules.vr": "1.0.0",
     "com.unity.modules.wind": "1.0.0",
     "com.unity.modules.xr": "1.0.0"
-  }
+  },
+  "scopedRegistries": [
+    {
+      "name": "OpenUPM",
+      "url": "https://package.openupm.com",
+      "scopes": [
+        "com.de-panther"
+      ]
+    }
+  ]
 }
