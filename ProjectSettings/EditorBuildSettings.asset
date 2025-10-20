@@ -9,6 +9,7 @@ EditorBuildSettings:
     path: Assets/Scenes/RecordingScene.unity
     guid: 99c9720ab356a0642a771bea13969a05
   m_configObjects:
+    WebXR.Settings: {fileID: 11400000, guid: 59de654ed24652d43a4ed0b1bdc1392a, type: 2}
     com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 26729ee50fce163479ca89b265c420ca,
       type: 2}
     com.unity.xr.openxr.settings4: {fileID: 11400000, guid: fd74ea196f644834e9e5ea8eb3ac801d,
