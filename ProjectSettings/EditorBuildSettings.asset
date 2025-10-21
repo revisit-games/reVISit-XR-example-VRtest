@@ -6,8 +6,8 @@ EditorBuildSettings:
   serializedVersion: 2
   m_Scenes:
   - enabled: 1
-    path: Assets/Scenes/RecordingScene.unity
-    guid: 99c9720ab356a0642a771bea13969a05
+    path: Assets/Scenes/RecordingScene 1.unity
+    guid: 58ec1d081a8995549bf979b47040c16a
   m_configObjects:
     WebXR.Settings: {fileID: 11400000, guid: 59de654ed24652d43a4ed0b1bdc1392a, type: 2}
     com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 26729ee50fce163479ca89b265c420ca,
